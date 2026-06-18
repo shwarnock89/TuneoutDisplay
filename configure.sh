@@ -270,12 +270,14 @@ section "System Update"
 # it THERE, not at 6.12 — re-image it to bring it back into the standard state.
 _RUNNING_KERNEL="$(uname -r)"
 case "$_RUNNING_KERNEL" in
-    6.12.*) success "Running proven kernel $_RUNNING_KERNEL." ;;
+    6.12.*) success "Running proven kernel $_RUNNING_KERNEL." ; KERNEL_PINNED_OK=yes ;;
     *)
+        KERNEL_PINNED_OK=no
         warn "Running kernel is $_RUNNING_KERNEL — NOT the pinned 6.12 series."
         warn "This display will not match the standard state. The clean fix is to"
         warn "re-image it with a 6.12-based Raspberry Pi OS, then re-run this script."
-        warn "Holding now freezes the kernel at $_RUNNING_KERNEL, not 6.12."
+        warn "The seeed audio driver cannot build on this kernel, so this run will"
+        warn "SKIP the driver install/build to avoid removing a working module."
         ;;
 esac
 
@@ -319,6 +321,17 @@ success "Dependencies installed."
 
 # ── ReSpeaker 2-Mic HAT Driver ────────────────────────────────────────────────
 section "ReSpeaker 2-Mic HAT Driver (seeed-voicecard)"
+
+# Guard: the seeed driver only builds on the pinned 6.12 kernel. On anything newer
+# (a device that slipped to 6.18), the seeed install.sh would destructively remove
+# the existing DKMS modules and then fail to rebuild — leaving the device with no
+# audio at all. Skip the whole section and tell the user to re-image instead.
+if [ "${KERNEL_PINNED_OK:-yes}" != "yes" ]; then
+    warn "Skipping seeed-voicecard driver setup — running kernel is $_RUNNING_KERNEL,"
+    warn "not the 6.12 series the driver supports. RE-IMAGE this device with a"
+    warn "6.12-based Raspberry Pi OS, then re-run ./configure.sh. Audio will not"
+    warn "work on this kernel until you do."
+else
 
 SEEED_DIR="$CURRENT_HOME/seeed-voicecard"
 
@@ -387,6 +400,8 @@ if dkms status seeed-voicecard 2>/dev/null | grep -q "seeed-voicecard"; then
         success "seeed-voicecard DKMS module current for kernel $_RUNNING_KERNEL."
     fi
 fi
+
+fi  # end KERNEL_PINNED_OK guard for the seeed-voicecard driver section
 
 # ── Microphone Wrapper Script (diagnostic / fallback) ─────────────────────────
 section "Microphone Wrapper Script"
@@ -1358,9 +1373,7 @@ printf "  │     %-57s│\n" "'$DEVICE_NAME'"
 echo "  │                                                             │"
 fi
 if [ "$MUSIC_PLAYER" = "caldera" ] || [ "$MUSIC_PLAYER" = "both" ]; then
-echo "  │  4b. Caldera: finish the one-time Plex login, then start:   │"
-echo "  │      ~/caldera-music/caldera-music --login                  │"
-echo "  │      systemctl --user enable --now caldera-music            │"
+echo "  │  4b. Caldera: one-time Plex login needed — see below.       │"
 echo "  │                                                             │"
 fi
 echo "  │  5. Say your wake word and test the voice pipeline!          │"
@@ -1372,6 +1385,27 @@ echo ""
 echo "  To follow live logs:"
 echo "    sudo journalctl -u linux-voice-assistant -f"
 echo ""
+
+# Caldera needs an interactive Plex login that cannot be scripted. Surface the
+# exact steps prominently at the very end so they're the last thing the user sees
+# (and easy to copy-paste) whether or not they reboot now.
+if [ "$MUSIC_PLAYER" = "caldera" ] || [ "$MUSIC_PLAYER" = "both" ]; then
+    echo -e "  ${BOLD}${MAGENTA}━━━  Caldera: one-time Plex login required  ━━━${NC}"
+    echo ""
+    echo "  Caldera won't play until it's linked to your Plex account. Run these"
+    echo "  as '$CURRENT_USER' on this device (after a reboot is fine):"
+    echo ""
+    echo -e "    ${BOLD}~/caldera-music/caldera-music --login${NC}"
+    echo "        Follow the on-screen prompt to authorise with Plex (one time)."
+    echo ""
+    echo -e "    ${BOLD}systemctl --user enable --now caldera-music${NC}"
+    echo "        Starts Caldera now and on every boot."
+    echo ""
+    echo "  Then play something from Plexamp and confirm voice/TTS still works at"
+    echo "  the same time (shared audio check). Logs:"
+    echo "    journalctl --user -u caldera-music -f"
+    echo ""
+fi
 
 read -rp "Reboot now? [Y/n] " DO_REBOOT
 DO_REBOOT="${DO_REBOOT:-Y}"
