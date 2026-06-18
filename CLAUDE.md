@@ -42,12 +42,28 @@ TuneoutDisplay/          ← repo name on Pi (note the 'e')
 | Service | Description | Runs as |
 |---------|-------------|---------|
 | `linux-voice-assistant` | LVA voice pipeline (ESPHome protocol, OWW wake word) | user |
-| `sendspin` | Music Assistant native player (sendspin protocol) | user |
-| `smart-display-mqtt` | MQTT bridge — registers HA entities via discovery | user |
+| `sendspin` | Music Assistant native player (sendspin protocol) — installed only when `MUSIC_PLAYER` is `music-assistant`/`both` | user |
+| `caldera-music` | Caldera headless Plex player — installed only when `MUSIC_PLAYER` is `caldera`/`both`; **systemd `--user` service**, self-updating | user |
+| `smart-display-mqtt` | MQTT bridge — registers HA entities via discovery; also drives Chromium over CDP for dashboard refresh | user |
 | `smart-display-audio-init` | Boot-time ALSA init — waits for card, applies codec settings | root (system) |
 | `smart-display-touch-scroll` | Touch→scroll daemon using uinput | root (system) |
 
 Credentials for the MQTT bridge are in `/etc/smart-display/mqtt.env` (mode 600).
+That file also carries `DASHBOARD_URL` (the kiosk URL, used by the `home`
+dashboard command) and `CDP_PORT` (Chromium remote-debugging port, default 9222).
+
+## Music player selection
+
+`configure.sh` prompts for `MUSIC_PLAYER` ∈ {`music-assistant`, `caldera`, `both`}
+(saved in `~/.smart-display-settings`). The sendspin and Caldera sections are each
+guarded by this value, and each section disables the *other* player's service when
+it's not selected, so re-running to switch backends is clean.
+
+Caldera specifics:
+- Installed via `curl -fsSL https://releases.caldera.homes/music/headless/install.sh | bash` into `~/caldera-music/`.
+- Requires a one-time interactive `caldera-music --login` (Plex device auth) that cannot be scripted; the script prints the manual steps and enables (but cannot start) the service.
+- ALSA-device selection could not be verified upstream, so instead of guessing a CLI flag the build forces Caldera's ALSA `default` onto `CALDERA_AUDIO_DEVICE` (default `seeed_media`) via a systemd `--user` drop-in that sets `ALSA_CONFIG_PATH=/etc/smart-display/caldera-asound.conf`. That config re-includes `/usr/share/alsa/alsa.conf` and `/etc/asound.conf` then overrides `pcm.!default`. **This is unverified — confirm coexistence with voice/TTS after first play.**
+- Self-updates in the background; the build does not pin its version. The drop-in survives updates.
 
 ---
 
@@ -121,6 +137,15 @@ The bridge registers all entities under device `DEVICE_ID` (derived from `DEVICE
 | `number` | `media_volume` | Music Assistant volume 0–100% | `amixer cset name="Media Volume"` |
 | `number` | `brightness` | Display backlight 0–100% | `/sys/class/backlight/10-0045/brightness` |
 | `number` | `mic_gain` | Mic sensitivity 0–100% | `amixer cset numid=1` (WM8960 Capture PGA, ALSA 0–63) |
+| `button` | `dashboard_reload` | Reload the kiosk page | CDP `Page.reload` via `localhost:CDP_PORT` |
+| `text` | `dashboard_url` | Navigate the kiosk to a URL | CDP `Page.navigate` via `localhost:CDP_PORT` |
+
+The button and text entity share one command topic, `…/dashboard/set`. Payload
+handling: `''`/`reload`/`refresh` → reload; `home` → navigate to `DASHBOARD_URL`;
+`http(s)://…` → navigate to that URL. The bridge reaches Chromium over the Chrome
+DevTools Protocol (`--remote-debugging-port=9222 --remote-allow-origins=*` in the
+labwc autostart), using the `python3-websocket` package. CDP is a plain TCP/WS
+call to localhost, so it works regardless of the bridge's graphical session.
 
 Brightness min values:
 - **MQTT entity min = 0** — allows automations to turn the display fully off
