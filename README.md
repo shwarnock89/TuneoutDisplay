@@ -85,6 +85,21 @@ Settings are saved after the first run — re-running the script will pre-fill a
 
 The script installs and configures everything automatically, then offers to reboot when done.
 
+### Kernel is pinned to 6.12
+
+The ReSpeaker driver (`seeed-voicecard`) is an out-of-tree DKMS module that breaks
+on newer kernels — 6.18 changed several ASoC APIs and will fail the build mid-upgrade,
+leaving `apt` half-broken. To keep every display identical and reproducible,
+`configure.sh` holds the kernel at the current **6.12** series before upgrading, so
+re-running the script is always safe. Userspace still gets updates; only the kernel
+is frozen.
+
+This assumes you flash displays from a 6.12-era Raspberry Pi OS image. If a device
+has already moved to a newer kernel, re-image it to bring it back to the standard
+state — an in-place downgrade isn't reliable on Raspberry Pi. To move the whole fleet
+forward later, validate the driver on the new kernel on one device first, then lift
+the hold (`sudo apt-mark unhold linux-image-rpi-v8 …`).
+
 ### Music player notes
 
 - **Music Assistant (Sendspin)** needs no extra steps — the player appears in MA 2.7+ automatically and routes through the `seeed_media` softvol device.

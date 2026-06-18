@@ -110,6 +110,31 @@ amixer -c seeed2micvoicec cset numid=13 122,122 -q
 
 ---
 
+## Kernel policy (pinned to 6.12)
+
+The seeed-voicecard DKMS driver is out-of-tree and breaks on ASoC API changes —
+kernel 6.18 removed the legacy `SND_SOC_DAIFMT_CB*_CF*` macros, changed the
+`SOC_SINGLE_VALUE` arity, and changed `simple_util_*` signatures, none of which
+the HinTak fork handles yet. To keep the fleet reproducible and avoid mid-upgrade
+dpkg breakage, `configure.sh` **holds the kernel at the current 6.12 series**:
+
+```bash
+sudo apt-mark hold linux-image-rpi-v8 linux-image-rpi-2712 \
+                   linux-headers-rpi-v8 linux-headers-rpi-2712
+```
+
+- The hold runs in the System Update section *before* `apt full-upgrade`, so the
+  upgrade keeps the kernel back while still patching userspace.
+- `apt-mark hold` freezes at the **currently installed** version. This assumes the
+  device is provisioned from a 6.12-era image. A device already on a newer kernel
+  (e.g. one that slipped to 6.18) freezes *there* — re-image it to standardise.
+- To intentionally move the fleet to a newer kernel later: validate the seeed
+  driver builds and audio works on it on ONE device, extend `patch_seeed_source`
+  for any new API breaks, then `apt-mark unhold` + bump.
+- Bringing a 6.18 device back to 6.12 in place (apt downgrade) is unreliable on
+  Raspberry Pi OS because the boot image (`/boot/firmware/kernel8.img`) is the
+  newest installed kernel — re-imaging is the dependable path.
+
 ## DKMS / kernel mismatch
 
 After `apt full-upgrade`, the newly installed kernel may not have the seeed-voicecard DKMS module built for it. Symptoms: `dmesg | grep wm8960` shows `No MCLK configured`, all `aplay` attempts fail even with the card enumerated.
@@ -117,6 +142,24 @@ After `apt full-upgrade`, the newly installed kernel may not have the seeed-voic
 `configure.sh` handles this via:
 1. After building/installing the module, it runs `dkms autoinstall` to cover all kernels in `/lib/modules/`.
 2. A post-upgrade check block detects if the running kernel is missing the module and rebuilds.
+
+### Source patches (`patch_seeed_source`)
+
+The seeed source needs kernel-API fixes that are applied by `patch_seeed_source()`
+(defined near the top of `configure.sh`, grep-guarded and idempotent):
+- **6.x:** `rtd->id` → `rtd->dai_link->id` (`snd_soc_pcm_runtime` lost `->id`).
+- **6.18:** the legacy ASoC clock master/slave DAI-format macros were removed.
+  `SND_SOC_DAIFMT_CBM_CFM`/`CBS_CFS`/`CBM_CFS`/`CBS_CFM` →
+  `CBP_CFP`/`CBC_CFC`/`CBP_CFC`/`CBC_CFP` (provider/consumer rename) across all
+  codec sources (`wm8960.c`, `ac101.c`, `ac108.c`). Symptom if missing:
+  `error: 'SND_SOC_DAIFMT_CBM_CFM' undeclared` in `make.log`, which fails the
+  kernel's DKMS post-install hook and leaves dpkg half-configured.
+
+**Critical ordering:** `patch_seeed_source` is called *before* `apt full-upgrade`,
+not only in the driver section. The upgrade can install a new kernel whose
+`header_postinst.d/dkms` hook rebuilds every DKMS module immediately; if the
+source is unpatched at that moment the hook fails and blocks the whole upgrade
+before the driver section is ever reached.
 
 Manual fix if needed:
 ```bash
@@ -201,6 +244,7 @@ Features:
 | Speaker volume resets on reboot | `alsactl restore` races with driver init; audio-init service may fire before codec settles | Volume is re-applied in labwc autostart (runs after session start, driver fully settled) |
 | dmix `unable to install hw params` | `pipewire-alsa` installed and intercepting ALSA | `sudo apt remove --purge pipewire-alsa` then reboot |
 | `No MCLK configured` in dmesg, all aplay fails | DKMS module built for old kernel, running new kernel post-upgrade | Rebuild for running kernel (see DKMS section above) |
+| `apt full-upgrade` fails with `header_postinst.d/dkms exited with return code 1`, kernel packages left unconfigured | seeed source won't compile against the new kernel headers (e.g. 6.18 removed the legacy `SND_SOC_DAIFMT_CB*_CF*` macros), failing the kernel's DKMS hook | Patch the source (`patch_seeed_source` logic), then `sudo apt --fix-broken install`. The script now pre-patches before upgrading to prevent this. |
 | Brightness entity accepts 0 but card won't go below 5 | Intentional design — automation can turn screen off; user slider cannot | Expected behaviour |
 
 ---

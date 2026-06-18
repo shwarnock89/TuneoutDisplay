@@ -27,6 +27,33 @@ warn()    { echo -e "${YELLOW}⚠${NC}  $1"; }
 err()     { echo -e "${RED}✘  ERROR:${NC} $1"; exit 1; }
 section() { echo -e "\n${BOLD}${BLUE}━━━  $1  ━━━${NC}\n"; }
 
+# ── seeed-voicecard source patches ─────────────────────────────────────────────
+# Apply kernel-API compatibility fixes to the seeed-voicecard DKMS source, IF it
+# is already unpacked in /usr/src. Each patch is grep-guarded, so this is safe to
+# call repeatedly. It is called BOTH before the system upgrade (so a newly
+# installed kernel's DKMS post-install hook builds cleanly instead of failing and
+# leaving dpkg half-configured) and again in the driver section for fresh installs.
+patch_seeed_source() {
+    local src="/usr/src/seeed-voicecard-0.3"
+    [ -d "$src" ] || return 0
+
+    # Kernel 6.x: snd_soc_pcm_runtime lost ->id (now reached via ->dai_link->id).
+    if grep -q "rtd->id" "$src/seeed-voicecard.c" 2>/dev/null; then
+        sudo sed -i 's/rtd->id/rtd->dai_link->id/g' "$src/seeed-voicecard.c"
+    fi
+
+    # Kernel 6.18: the legacy ASoC clock master/slave DAI-format macros
+    # (SND_SOC_DAIFMT_CB{M,S}_CF{M,S}) were removed in favour of provider/consumer
+    # naming. Pure rename — CBM/CBS → CBP/CBC, CFM/CFS → CFP/CFC.
+    if grep -rqE 'SND_SOC_DAIFMT_CB[MS]_CF[MS]' "$src" 2>/dev/null; then
+        sudo find "$src" -name '*.c' -exec sed -i \
+            -e 's/SND_SOC_DAIFMT_CBM_CFM/SND_SOC_DAIFMT_CBP_CFP/g' \
+            -e 's/SND_SOC_DAIFMT_CBS_CFM/SND_SOC_DAIFMT_CBC_CFP/g' \
+            -e 's/SND_SOC_DAIFMT_CBM_CFS/SND_SOC_DAIFMT_CBP_CFC/g' \
+            -e 's/SND_SOC_DAIFMT_CBS_CFS/SND_SOC_DAIFMT_CBC_CFC/g' {} +
+    fi
+}
+
 # ── Banner ────────────────────────────────────────────────────────────────────
 clear
 echo -e "${MAGENTA}"
@@ -229,11 +256,45 @@ DEVICE_HOSTNAME=$(hostname)
 # ── System Update ─────────────────────────────────────────────────────────────
 section "System Update"
 
+# ── Kernel policy: freeze on the proven 6.12 series ───────────────────────────
+# This appliance carries an out-of-tree DKMS audio driver (seeed-voicecard) that
+# breaks whenever a kernel changes the ASoC API — kernel 6.18 removed several
+# symbols the seeed codecs use and left dpkg half-configured mid-upgrade. To keep
+# every display in a known-good, reproducible state, we HOLD the kernel at its
+# current 6.12 version so 'apt full-upgrade' never advances it. Userspace still
+# gets security updates; the kernel only moves when you deliberately bump the pin
+# (after validating the driver on the new kernel on ONE device first).
+#
+# Assumption: displays are provisioned from a 6.12-era Raspberry Pi OS image. If a
+# device is already on a newer kernel (e.g. it slipped to 6.18), holding freezes
+# it THERE, not at 6.12 — re-image it to bring it back into the standard state.
+_RUNNING_KERNEL="$(uname -r)"
+case "$_RUNNING_KERNEL" in
+    6.12.*) success "Running proven kernel $_RUNNING_KERNEL." ;;
+    *)
+        warn "Running kernel is $_RUNNING_KERNEL — NOT the pinned 6.12 series."
+        warn "This display will not match the standard state. The clean fix is to"
+        warn "re-image it with a 6.12-based Raspberry Pi OS, then re-run this script."
+        warn "Holding now freezes the kernel at $_RUNNING_KERNEL, not 6.12."
+        ;;
+esac
+
+info "Holding kernel packages (freeze at the current 6.12 series)..."
+sudo apt-mark hold linux-image-rpi-v8 linux-image-rpi-2712 \
+                   linux-headers-rpi-v8 linux-headers-rpi-2712 2>/dev/null || true
+success "Kernel held — full-upgrade will not change it."
+
+# Defensive: if a seeed source tree is already unpacked, patch it for known
+# kernel-API changes before upgrading. With the kernel held this is a no-op, but
+# it protects against the half-configured-dpkg trap if the hold is ever lifted.
+info "Pre-patching seeed-voicecard source for kernel API changes (if present)..."
+patch_seeed_source
+
 info "Updating package lists..."
 sudo apt update -qq
-info "Upgrading packages (this may take a few minutes)..."
+info "Upgrading packages (kernel held; this may take a few minutes)..."
 sudo apt full-upgrade -y -qq
-success "System up to date."
+success "System up to date (kernel pinned to 6.12)."
 
 # ── Dependencies ──────────────────────────────────────────────────────────────
 section "Installing Dependencies"
@@ -286,13 +347,12 @@ SEEED_SOURCE="/usr/src/seeed-voicecard-0.3/seeed-voicecard.c"
 if [ ! -f "$SEEED_SOURCE" ]; then
     warn "Could not find $SEEED_SOURCE — skipping DKMS patch/build."
 else
-    if grep -q "rtd->id" "$SEEED_SOURCE"; then
-        info "Applying kernel 6.x API patch (rtd->id → rtd->dai_link->id)..."
-        sudo sed -i 's/rtd->id/rtd->dai_link->id/g' "$SEEED_SOURCE"
-        success "Patch applied."
-    else
-        info "Patch already applied or not needed — skipping."
-    fi
+    # Apply all kernel-API compatibility patches (rtd->id for 6.x, ASoC DAIFMT
+    # clock-macro rename for 6.18+). Grep-guarded and idempotent — see
+    # patch_seeed_source() near the top of this script.
+    info "Applying kernel-API compatibility patches to seeed source..."
+    patch_seeed_source
+    success "Source patches applied (idempotent)."
 
     info "Building DKMS module for kernel $(uname -r)..."
     if sudo dkms build -m seeed-voicecard -v 0.3 --force 2>&1 | grep -q "Error"; then
