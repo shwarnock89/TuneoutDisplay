@@ -822,14 +822,32 @@ if [ "$MUSIC_PLAYER" = "music-assistant" ] || [ "$MUSIC_PLAYER" = "both" ]; then
     # The MA server-side provider is always enabled — no configuration needed in MA.
     # The client auto-discovers the MA server via mDNS and registers itself by name.
     # Note: Sendspin is currently in technical preview.
+    #
+    # sendspin requires Python 3.12+, but this kernel-pinned OS image's system
+    # Python may be older (e.g. Bookworm-era 3.11) -- so rather than depend on
+    # `python3 -m venv` using whatever the OS ships, bootstrap an isolated
+    # Python 3.12 via 'uv' (a standalone Python version manager) and build the
+    # venv from that specific interpreter. This doesn't touch or replace the
+    # system python3 at all -- it's a separate, self-contained runtime used
+    # only for this venv.
 
     info "Installing sendspin dependency (libportaudio2)..."
     sudo apt install -y libportaudio2
 
+    info "Ensuring an isolated Python 3.12 runtime is available via uv..."
+    if ! command -v uv &>/dev/null; then
+        curl -LsSf https://astral.sh/uv/install.sh | sh
+        export PATH="$CURRENT_HOME/.local/bin:$PATH"
+    fi
+    uv python install 3.12
+    PY312="$(uv python find 3.12)"
+    info "Using Python 3.12 at: $PY312"
+
     # Install into an isolated venv to avoid conflicts with Debian system packages
     # (sendspin depends on typing_extensions which Debian also owns via apt)
-    info "Installing sendspin into /opt/sendspin venv..."
-    [ -d /opt/sendspin ] || sudo python3 -m venv /opt/sendspin
+    info "Installing sendspin into /opt/sendspin venv (Python 3.12)..."
+    sudo rm -rf /opt/sendspin
+    sudo "$PY312" -m venv /opt/sendspin
     sudo /opt/sendspin/bin/pip install --upgrade sendspin -q
 
     info "Creating sendspin.service..."
