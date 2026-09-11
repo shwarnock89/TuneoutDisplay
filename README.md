@@ -149,14 +149,62 @@ The custom card gives you volume, brightness, voice status, and a mute toggle in
 3. Add the card to a dashboard:
 
 ```yaml
-type: custom:smart-display-card
-name: My Display
-satellite_entity: assist_satellite.YOUR_DEVICE
-tts_volume_entity: number.YOUR_DEVICE_tts_volume
-media_volume_entity: number.YOUR_DEVICE_media_volume
-brightness_entity: number.YOUR_DEVICE_brightness
-mute_entity: switch.YOUR_DEVICE_mute        # optional — enables chip tap-to-mute
-mic_gain_entity: number.YOUR_DEVICE_mic_gain  # optional
+wallpanel:
+  enabled: true
+  fullscreen: true
+  hide_toolbar: true
+  hide_sidebar: true
+  idle_time: 60
+  image_url: media-source://media_source/local/Photos
+  media_order: random
+  image_fit_landscape: contain
+  image_background: image
+  display_time: 10
+swipe_nav:
+  enable_mouse_swipe: true
+  wrap: true
+  animate: swipe
+  prevent_default: true
+  swipe_amount: 30
+views:
+  - title: Home
+    path: home
+    icon: mdi:home
+    cards:
+      - type: custom:smart-display-card
+        name: Kitchen Display
+        satellite_entity: assist_satellite.speaker_assist_satellite
+        tts_volume_entity: number.speaker_voice_volume
+        media_volume_entity: number.speaker_media_volume
+        brightness_entity: number.speaker_brightness
+        mute_entity: switch.speaker_mute
+        mic_gain_entity: number.speaker_mic_volume
+      - type: horizontal-stack
+        cards:
+          - type: clock
+            clock_size: large
+          - type: weather-forecast
+            entity: weather.forecast_home
+            show_current: true
+            show_forecast: false
+      - type: area
+        area: kitchen
+        show:
+          camera_image: false
+          sensors: false
+  - title: Music
+    path: music
+    icon: mdi:music
+    cards:
+      - type: media-control
+        entity: media_player.speaker
+  - title: Lists
+    path: lists
+    icon: mdi:cart
+    cards:
+      - type: todo-list
+        entity: todo.grocery_list
+
 ```
 
 Find your exact entity IDs under **Developer Tools → States** and search for your device name.
