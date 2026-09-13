@@ -27,12 +27,12 @@ warn()    { echo -e "${YELLOW}⚠${NC}  $1"; }
 err()     { echo -e "${RED}✘  ERROR:${NC} $1"; exit 1; }
 section() { echo -e "\n${BOLD}${BLUE}━━━  $1  ━━━${NC}\n"; }
 
-# ── seeed-voicecard source patches ─────────────────────────────────────────────
-# Apply kernel-API compatibility fixes to the seeed-voicecard DKMS source, IF it
-# is already unpacked in /usr/src. Each patch is grep-guarded, so this is safe to
-# call repeatedly. It is called BOTH before the system upgrade (so a newly
-# installed kernel's DKMS post-install hook builds cleanly instead of failing and
-# leaving dpkg half-configured) and again in the driver section for fresh installs.
+# ── seeed-voicecard source patches (V1/WM8960 board only) ─────────────────────
+# The V1 board uses an out-of-tree DKMS kernel module (C source) that needs
+# kernel-API compatibility patches applied. The V2.0 board uses a plain device
+# tree overlay instead (compiled once via seeed-linux-dtoverlays, no DKMS, no
+# kernel-version sensitivity) -- this function is only called from the V1
+# branch of the driver section further down.
 patch_seeed_source() {
     local src="/usr/src/seeed-voicecard-0.3"
     [ -d "$src" ] || return 0
@@ -51,6 +51,18 @@ patch_seeed_source() {
             -e 's/SND_SOC_DAIFMT_CBS_CFM/SND_SOC_DAIFMT_CBC_CFP/g' \
             -e 's/SND_SOC_DAIFMT_CBM_CFS/SND_SOC_DAIFMT_CBP_CFC/g' \
             -e 's/SND_SOC_DAIFMT_CBS_CFS/SND_SOC_DAIFMT_CBC_CFC/g' {} +
+    fi
+
+    # dkms.conf's ac108 (4-mic array, unused) entry breaks the numbered-array
+    # format if blindly deleted -- guard on the exact known-broken pattern and
+    # renumber correctly rather than leaving a gap DKMS can't parse.
+    if [ -f "$src/dkms.conf" ] && grep -q 'BUILT_MODULE_NAME\[1\]="snd-soc-ac108"' "$src/dkms.conf" 2>/dev/null; then
+        sudo sed -i \
+            -e '/BUILT_MODULE_NAME\[1\]="snd-soc-ac108"/d' \
+            -e '/DEST_MODULE_LOCATION\[1\]="\/kernel\/sound\/soc\/codecs"/d' \
+            -e 's/BUILT_MODULE_NAME\[2\]="snd-soc-seeed-voicecard"/BUILT_MODULE_NAME[1]="snd-soc-seeed-voicecard"/' \
+            -e 's/DEST_MODULE_LOCATION\[2\]="\/kernel\/sound\/soc\/bcm"/DEST_MODULE_LOCATION[1]="\/kernel\/sound\/soc\/bcm"/' \
+            "$src/dkms.conf"
     fi
 }
 
@@ -130,6 +142,32 @@ fi
 _def="${DEVICE_NAME:-Smart Display}"
 read -rp "  Device name              [${_def}]: " _in
 DEVICE_NAME="${_in:-${_def}}"
+
+echo ""
+echo "  ── Hardware ──"
+echo "  Which Raspberry Pi + ReSpeaker HAT combination is this device?"
+echo "    1) Pi 4  + ReSpeaker 2-Mic HAT V1  (WM8960 codec)"
+echo "    2) Pi 5  + ReSpeaker 2-Mic HAT V2.0 (TLV320AIC3104 codec)"
+echo ""
+echo "  Only these two combinations are supported by this script -- both have"
+echo "  been validated in this project. Pi4+V2.0 or Pi5+V1 are untested; pick"
+echo "  whichever matches your actual board, don't mix-and-match."
+echo ""
+_def="${HARDWARE_VARIANT:-pi5-v2}"
+while true; do
+    read -rp "  Hardware [1=pi4-v1 / 2=pi5-v2] [${_def}]: " _in
+    _in="${_in:-${_def}}"
+    case "$_in" in
+        1|pi4-v1) HARDWARE_VARIANT="pi4-v1"; break ;;
+        2|pi5-v2) HARDWARE_VARIANT="pi5-v2"; break ;;
+        *) warn "Enter 1 or 2" ;;
+    esac
+done
+if [ "$HARDWARE_VARIANT" = "pi4-v1" ]; then
+    success "Selected: Pi 4 + ReSpeaker V1 (WM8960)"
+else
+    success "Selected: Pi 5 + ReSpeaker V2.0 (TLV320AIC3104)"
+fi
 
 _def="${HA_SERVER:-http://homeassistant.local:8123}"
 read -rp "  Home Assistant URL  [${_def}]: " _in
@@ -219,6 +257,7 @@ echo ""
 echo -e "  ${BOLD}Summary${NC}"
 echo "  ┌────────────────────────────────────────────────────────┐"
 printf  "  │  Device name  : %-38s│\n" "$DEVICE_NAME"
+printf  "  │  Hardware     : %-38s│\n" "$HARDWARE_VARIANT"
 printf  "  │  HA server    : %-38s│\n" "$HA_SERVER"
 printf  "  │  Wake word    : %-38s│\n" "$WAKE_WORD"
 printf  "  │  Music player : %-38s│\n" "$MUSIC_PLAYER"
@@ -236,6 +275,7 @@ CONFIRM="${CONFIRM:-Y}"
 # need it re-entered, but the file is mode 600 so only this user can read it.
 cat > "$_SETTINGS_FILE" << SAVEEOF
 DEVICE_NAME="$DEVICE_NAME"
+HARDWARE_VARIANT="$HARDWARE_VARIANT"
 HA_SERVER="$HA_SERVER"
 WAKE_WORD="$WAKE_WORD"
 MUSIC_PLAYER="$MUSIC_PLAYER"
@@ -256,47 +296,39 @@ DEVICE_HOSTNAME=$(hostname)
 # ── System Update ─────────────────────────────────────────────────────────────
 section "System Update"
 
-# ── Kernel policy: freeze on the proven 6.12 series ───────────────────────────
-# This appliance carries an out-of-tree DKMS audio driver (seeed-voicecard) that
-# breaks whenever a kernel changes the ASoC API — kernel 6.18 removed several
-# symbols the seeed codecs use and left dpkg half-configured mid-upgrade. To keep
-# every display in a known-good, reproducible state, we HOLD the kernel at its
-# current 6.12 version so 'apt full-upgrade' never advances it. Userspace still
-# gets security updates; the kernel only moves when you deliberately bump the pin
-# (after validating the driver on the new kernel on ONE device first).
-#
-# Assumption: displays are provisioned from a 6.12-era Raspberry Pi OS image. If a
-# device is already on a newer kernel (e.g. it slipped to 6.18), holding freezes
-# it THERE, not at 6.12 — re-image it to bring it back into the standard state.
+# ── Kernel policy: pin only needed for the V1/WM8960 board ────────────────────
+# The V1 board's out-of-tree DKMS driver breaks on ASoC API changes, so we hold
+# the kernel at the proven 6.12 series for that variant. The V2.0 board uses a
+# plain, precompiled-once device tree overlay instead -- no DKMS, no
+# kernel-version sensitivity -- so no pin is needed there at all.
 _RUNNING_KERNEL="$(uname -r)"
-case "$_RUNNING_KERNEL" in
-    6.12.*) success "Running proven kernel $_RUNNING_KERNEL." ; KERNEL_PINNED_OK=yes ;;
-    *)
-        KERNEL_PINNED_OK=no
-        warn "Running kernel is $_RUNNING_KERNEL — NOT the pinned 6.12 series."
-        warn "This display will not match the standard state. The clean fix is to"
-        warn "re-image it with a 6.12-based Raspberry Pi OS, then re-run this script."
-        warn "The seeed audio driver cannot build on this kernel, so this run will"
-        warn "SKIP the driver install/build to avoid removing a working module."
-        ;;
-esac
 
-info "Holding kernel packages (freeze at the current 6.12 series)..."
-sudo apt-mark hold linux-image-rpi-v8 linux-image-rpi-2712 \
-                   linux-headers-rpi-v8 linux-headers-rpi-2712 2>/dev/null || true
-success "Kernel held — full-upgrade will not change it."
-
-# Defensive: if a seeed source tree is already unpacked, patch it for known
-# kernel-API changes before upgrading. With the kernel held this is a no-op, but
-# it protects against the half-configured-dpkg trap if the hold is ever lifted.
-info "Pre-patching seeed-voicecard source for kernel API changes (if present)..."
-patch_seeed_source
+if [ "$HARDWARE_VARIANT" = "pi4-v1" ]; then
+    case "$_RUNNING_KERNEL" in
+        6.12.*) success "Running proven kernel $_RUNNING_KERNEL." ; KERNEL_PINNED_OK=yes ;;
+        *)
+            KERNEL_PINNED_OK=no
+            warn "Running kernel is $_RUNNING_KERNEL — NOT the pinned 6.12 series."
+            warn "This display will not match the standard state. The clean fix is to"
+            warn "re-image it with a 6.12-based Raspberry Pi OS, then re-run this script."
+            warn "The seeed audio driver cannot build on this kernel, so this run will"
+            warn "SKIP the driver install/build to avoid removing a working module."
+            ;;
+    esac
+    info "Holding kernel packages (freeze at the current 6.12 series)..."
+    sudo apt-mark hold linux-image-rpi-v8 linux-image-rpi-2712 \
+                       linux-headers-rpi-v8 linux-headers-rpi-2712 2>/dev/null || true
+    success "Kernel held — full-upgrade will not change it."
+else
+    KERNEL_PINNED_OK=yes   # not applicable for V2.0, but keep the variable sane
+    info "Running kernel: $_RUNNING_KERNEL (no pin needed for the V2.0 ReSpeaker board)."
+fi
 
 info "Updating package lists..."
 sudo apt update -qq
-info "Upgrading packages (kernel held; this may take a few minutes)..."
+info "Upgrading packages..."
 sudo apt full-upgrade -y -qq
-success "System up to date (kernel pinned to 6.12)."
+success "System up to date."
 
 # ── Dependencies ──────────────────────────────────────────────────────────────
 section "Installing Dependencies"
@@ -328,8 +360,9 @@ info "Ensuring paho-mqtt is 2.0+ (required by mqtt-bridge.py)..."
 sudo pip install --upgrade paho-mqtt --break-system-packages -q
 success "Dependencies installed."
 
-# ── ReSpeaker 2-Mic HAT Driver ────────────────────────────────────────────────
-section "ReSpeaker 2-Mic HAT Driver (seeed-voicecard)"
+# ── ReSpeaker 2-Mic HAT Driver ─────────────────────────────────────────────────
+if [ "$HARDWARE_VARIANT" = "pi4-v1" ]; then
+section "ReSpeaker 2-Mic HAT Driver (V1, WM8960 DKMS)"
 
 # Guard: the seeed driver only builds on the pinned 6.12 kernel. On anything newer
 # (a device that slipped to 6.18), the seeed install.sh would destructively remove
@@ -358,7 +391,7 @@ if dkms status seeed-voicecard 2>/dev/null | grep -q "seeed-voicecard"; then
 else
     info "Running install.sh..."
     cd "$SEEED_DIR"
-    sudo ./install.sh
+    sudo ./install.sh || true
     cd "$CURRENT_HOME"
 fi
 
@@ -369,9 +402,6 @@ SEEED_SOURCE="/usr/src/seeed-voicecard-0.3/seeed-voicecard.c"
 if [ ! -f "$SEEED_SOURCE" ]; then
     warn "Could not find $SEEED_SOURCE — skipping DKMS patch/build."
 else
-    # Apply all kernel-API compatibility patches (rtd->id for 6.x, ASoC DAIFMT
-    # clock-macro rename for 6.18+). Grep-guarded and idempotent — see
-    # patch_seeed_source() near the top of this script.
     info "Applying kernel-API compatibility patches to seeed source..."
     patch_seeed_source
     success "Source patches applied (idempotent)."
@@ -382,21 +412,11 @@ else
     fi
     sudo dkms install -m seeed-voicecard -v 0.3 --force
 
-    # apt full-upgrade above may have installed a newer kernel that will become
-    # active after the reboot at the end of this script.  dkms autoinstall
-    # ensures the module is built and installed for every kernel found in
-    # /lib/modules/, including any newly upgraded one.
     info "Running dkms autoinstall to cover all installed kernels..."
     sudo dkms autoinstall -m seeed-voicecard -v 0.3 2>/dev/null || true
     success "seeed-voicecard DKMS module installed."
 fi
 
-# ── DKMS Kernel Version Check ────────────────────────────────────────────────
-# apt full-upgrade (run above) may have installed a newer kernel that will be
-# active after the reboot at the end of this script.  If the running kernel
-# was itself upgraded since the last configure run, the seeed module for the
-# CURRENT kernel may also be missing.  Detect and rebuild so audio works on
-# first boot without requiring a second run of the script.
 _RUNNING_KERNEL="$(uname -r)"
 if dkms status seeed-voicecard 2>/dev/null | grep -q "seeed-voicecard"; then
     if ! dkms status seeed-voicecard 2>/dev/null | grep -q "$_RUNNING_KERNEL"; then
@@ -410,7 +430,51 @@ if dkms status seeed-voicecard 2>/dev/null | grep -q "seeed-voicecard"; then
     fi
 fi
 
-fi  # end KERNEL_PINNED_OK guard for the seeed-voicecard driver section
+fi  # end KERNEL_PINNED_OK guard
+
+else
+section "ReSpeaker 2-Mic HAT Driver (V2.0 device tree overlay)"
+
+# The V2.0 board needs a plain device tree overlay -- no DKMS, no kernel-version
+# sensitivity, no out-of-tree C module to patch/rebuild per kernel. Compiled
+# once via Seeed's own seeed-linux-dtoverlays repo, then loaded via config.txt
+# on every boot going forward. Per Seeed's current official wiki
+# (wiki.seeedstudio.com/respeaker_2_mics_pi_hat_raspberry_v2/).
+
+sudo apt install -y device-tree-compiler build-essential
+
+OVERLAY_DIR="$CURRENT_HOME/seeed-linux-dtoverlays"
+OVERLAY_DTBO="/boot/firmware/overlays/respeaker-2mic-v2_0.dtbo"
+
+if [ -d "$OVERLAY_DIR" ]; then
+    warn "seeed-linux-dtoverlays directory already exists — pulling latest..."
+    git -C "$OVERLAY_DIR" pull
+else
+    info "Cloning seeed-linux-dtoverlays..."
+    git clone https://github.com/Seeed-Studio/seeed-linux-dtoverlays.git "$OVERLAY_DIR"
+fi
+
+info "Compiling the V2.0 device tree overlay..."
+cd "$OVERLAY_DIR"
+make overlays/rpi/respeaker-2mic-v2_0-overlay.dtbo
+cd "$CURRENT_HOME"
+
+info "Installing the compiled overlay..."
+sudo cp "$OVERLAY_DIR/overlays/rpi/respeaker-2mic-v2_0-overlay.dtbo" "$OVERLAY_DTBO"
+
+if ! grep -q "^dtoverlay=respeaker-2mic-v2_0" /boot/firmware/config.txt 2>/dev/null; then
+    echo "dtoverlay=respeaker-2mic-v2_0" | sudo tee -a /boot/firmware/config.txt > /dev/null
+    success "Overlay added to config.txt (takes effect after the reboot at the end of this script)."
+else
+    info "Overlay already present in config.txt — skipping."
+fi
+success "ReSpeaker V2.0 overlay compiled and installed."
+
+# V2.0 board speaker/HP volume numids (1/15/17/20/22) are confirmed correct --
+# verified via live hardware testing. See the Audio Initialisation Service
+# section below for the actual values. Mic gain (numid=34) uses its default
+# and hasn't been wired to the "Mic Sensitivity" HA entity the way V1's is.
+fi  # end HARDWARE_VARIANT driver branch
 
 # ── Microphone Wrapper Script (diagnostic / fallback) ─────────────────────────
 section "Microphone Wrapper Script"
@@ -423,7 +487,7 @@ MIC_SCRIPT="$CURRENT_HOME/mic.sh"
 
 cat > "$MIC_SCRIPT" << 'MICEOF'
 #!/bin/bash
-# Records stereo 48kHz (WM8960 native rate) and converts to 16kHz mono.
+# Records stereo 48kHz (native rate for both supported boards) and converts to 16kHz mono.
 # Kept for diagnostics — LVA uses PipeWire for mic input, not this script.
 arecord -D hw:CARD=seeed2micvoicec,DEV=0 -r 48000 -c 2 -f S16_LE -t raw | \
     sox -t raw -r 48000 -L -e signed -b 16 -c 2 - \
@@ -676,7 +740,7 @@ section "Speaker Volume"
 # volume directly via amixer and persist the level to the state file used by
 # the volume button service.
 if amixer -c seeed2micvoicec controls 2>/dev/null | grep -qi "speaker"; then
-    info "Setting WM8960 hardware speaker to 94% (fixed master level)..."
+    info "Setting seeed codec hardware speaker to 94% (fixed master level)..."
     amixer -c seeed2micvoicec sset 'Speaker' 94% -q
     success "Hardware speaker level set."
 else
@@ -717,8 +781,8 @@ sudo tee /usr/local/bin/smart-display-audio-init.sh > /dev/null << SCRIPTEOF
 # Smart Display audio initialisation.
 # Called by smart-display-audio-init.service at every boot.
 
-# Wait up to 30 s for the seeed WM8960 card to be enumerated by the kernel.
-# The DKMS module loads via udev and can arrive well after sound.target.
+# Wait up to 30 s for the seeed card to be enumerated by the kernel.
+# The driver loads via udev and can arrive well after sound.target.
 for i in \$(seq 1 30); do
     amixer -c seeed2micvoicec info &>/dev/null && break
     sleep 1
@@ -727,10 +791,14 @@ done
 # Restore the full ALSA mixer state saved by 'alsactl store'.
 /usr/sbin/alsactl restore 2>/dev/null || true
 
+SCRIPTEOF
+
+if [ "$HARDWARE_VARIANT" = "pi4-v1" ]; then
+    # V1/WM8960: these numids are confirmed correct for this specific codec.
+    sudo tee -a /usr/local/bin/smart-display-audio-init.sh > /dev/null << SCRIPTEOF
 # Set WM8960 hardware speaker to true max (numid=13, value=127 on the 0–127 / -121dB scale).
 # This must be re-applied every boot because alsactl restore can be beaten by the
-# driver resetting codec registers after enumeration.  Keeping it here rather than
-# in asound.state makes the intent explicit and self-documenting.
+# driver resetting codec registers after enumeration.
 amixer -c seeed2micvoicec cset numid=13 127,127 -q 2>/dev/null || true
 
 # Re-apply ALC settings explicitly. Enumerated controls (type=ENUMERATED) are
@@ -741,8 +809,6 @@ amixer -c seeed2micvoicec cset numid=32 2     -q  # ALC Decay    → faster
 
 # Restore Capture PGA gain from state file if available; otherwise use the
 # default of ALSA value 40 (~63% of the 0–63 range, ≈ 0 dB on WM8960).
-# The MQTT bridge exposes this as the 'Mic Sensitivity' entity so each
-# device can be tuned for its acoustic environment from Home Assistant.
 MIC_GAIN_FILE="$CURRENT_HOME/.smart-display-mic-gain"
 if [ -f "\$MIC_GAIN_FILE" ]; then
     _MIC_PCT=\$(cat "\$MIC_GAIN_FILE")
@@ -751,6 +817,32 @@ if [ -f "\$MIC_GAIN_FILE" ]; then
 else
     amixer -c seeed2micvoicec cset numid=1 40,40 -q 2>/dev/null || true
 fi
+SCRIPTEOF
+else
+    # V2.0/TLV320AIC3104: confirmed working numids, verified live on real
+    # hardware. This codec has a two-stage volume path per output (a digital
+    # DAC volume 0-118, plus a separate small analog boost stage 0-9) -- the
+    # boost stage defaults to 0 and is very quiet until raised, which is what
+    # caused near-silent playback during testing until both stages were maxed.
+    sudo tee -a /usr/local/bin/smart-display-audio-init.sh > /dev/null << SCRIPTEOF
+# TLV320AIC3104 (V2.0 board) -- confirmed correct numids via live testing.
+amixer -c seeed2micvoicec cset numid=1  127,127 -q 2>/dev/null || true  # PCM Playback Volume -> max
+amixer -c seeed2micvoicec cset numid=15 118,118 -q 2>/dev/null || true  # Line DAC Playback Volume -> max
+amixer -c seeed2micvoicec cset numid=20 9,9     -q 2>/dev/null || true  # Line Playback Volume (analog boost stage) -> max
+amixer -c seeed2micvoicec cset numid=17 118,118 -q 2>/dev/null || true  # HP DAC Playback Volume -> max
+amixer -c seeed2micvoicec cset numid=22 9,9     -q 2>/dev/null || true  # HP Playback Volume (analog boost stage) -> max
+
+# Mic gain (PGA Capture Volume, numid=34, range 0-119) worked fine at its
+# default (32) during testing -- not touched here. If you want it tunable via
+# the HA "Mic Sensitivity" entity like the V1 board, this is the numid to wire
+# up the same way the V1 branch above does with its MIC_GAIN_FILE logic.
+
+# Full control dump still saved for reference/troubleshooting:
+amixer -c seeed2micvoicec controls > "$CURRENT_HOME/.smart-display-mixer-controls-v2.txt" 2>/dev/null || true
+SCRIPTEOF
+fi
+
+sudo tee -a /usr/local/bin/smart-display-audio-init.sh > /dev/null << SCRIPTEOF
 
 # Restore per-stream software volumes from state files.
 # TTS Volume  → controls LVA/voice playback level (seeed_tts softvol device, used by mpv)
@@ -813,10 +905,19 @@ section "Backlight Permissions"
 
 # The DSI display backlight is owned by root. Grant the video group write access
 # so the MQTT bridge can adjust brightness without sudo.
-# The kernel name "10-0045" is the I2C address of the display controller.
-info "Setting up backlight udev rule for display (10-0045)..."
-sudo tee /etc/udev/rules.d/99-backlight.rules > /dev/null << 'EOF'
-SUBSYSTEM=="backlight", KERNEL=="10-0045", GROUP="video", MODE="0664"
+# The kernel name is the I2C address of the display controller, and it DIFFERS
+# between Pi 4 and Pi 5 -- Pi 5's RP1 southbridge renumbers I2C buses vs Pi 4.
+# Confirmed earlier in this project via: ls /sys/class/backlight/  (check this
+# matches your actual system if backlight control doesn't work -- it's this
+# exact node name that matters, not the hardware variant assumption below).
+if [ "$HARDWARE_VARIANT" = "pi4-v1" ]; then
+    _BACKLIGHT_NODE="10-0045"
+else
+    _BACKLIGHT_NODE="11-0045"
+fi
+info "Setting up backlight udev rule for display ($_BACKLIGHT_NODE)..."
+sudo tee /etc/udev/rules.d/99-backlight.rules > /dev/null << EOF
+SUBSYSTEM=="backlight", KERNEL=="$_BACKLIGHT_NODE", GROUP="video", MODE="0664"
 EOF
 sudo usermod -a -G video "$CURRENT_USER"
 sudo udevadm control --reload-rules && sudo udevadm trigger
@@ -1369,8 +1470,10 @@ journalctl -u smart-display-mqtt -f
 # Test speaker output
 aplay -D seeed_tts /usr/share/sounds/alsa/Front_Left.wav
 
-# Check seeed DKMS module (should show current kernel version)
-dkms status seeed-voicecard
+# Check the audio driver:
+#   V1 (WM8960):        dkms status seeed-voicecard
+#   V2.0 (TLV320AIC3104): ls /boot/firmware/overlays/respeaker-2mic-v2_0.dtbo
+aplay -l   # either way, confirm 'seeed2micvoicec' shows up here
 
 # Re-run configure script (idempotent — safe to run again to change settings)
 cd ~/TuneoutDisplay && ./configure.sh
