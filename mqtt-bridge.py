@@ -9,10 +9,12 @@ plus a Stop TTS button — no rest_command or input_number YAML required.
 Entities created in HA:
   number  → Voice Volume     (controls Wyoming/TTS playback via seeed_tts softvol)
   number  → Media Volume     (controls Music Assistant playback via seeed_media softvol)
-  number  → Brightness       (controls DSI backlight)
-  number  → Mic Sensitivity  (WM8960 Capture PGA gain)
-  button  → Reload Dashboard (reloads the kiosk page over CDP)
-  text    → Dashboard URL    (navigates the kiosk to any URL over CDP)
+  number  → Mic Sensitivity  (WM8960/TLV320AIC3104 Capture PGA gain)
+
+  The following are only created when HAS_DISPLAY=true (see below):
+  number  → Brightness         (controls DSI backlight)
+  button  → Reload Dashboard   (reloads the kiosk page over CDP)
+  text    → Dashboard URL      (navigates the kiosk to any URL over CDP)
 
 Configuration (set via systemd environment / EnvironmentFile):
   MQTT_HOST      Broker hostname or IP   (default: homeassistant.local)
@@ -21,6 +23,12 @@ Configuration (set via systemd environment / EnvironmentFile):
   MQTT_PASSWORD  Broker password         (default: empty)
   DEVICE_NAME    Human-readable name     (default: Smart Display)
   DEVICE_ID      Unique slug for topics  (default: derived from hostname)
+  HAS_DISPLAY    Register display-only entities (brightness, dashboard
+                 reload/URL) — "true"/"1"/"yes" or "false"/"0"/"no"
+                 (default: true, for backward compatibility with existing
+                 display satellites that don't set this explicitly)
+  BACKLIGHT_NODE Backlight sysfs node name (default: 10-0045, matching Pi 4;
+                 Pi 5 display satellites should set this to 11-0045)
 """
 
 import json
@@ -42,47 +50,57 @@ except Exception:  # pragma: no cover
     websocket = None
 
 # ── Configuration ──────────────────────────────────────────────────────────────
-MQTT_HOST     = os.getenv("MQTT_HOST",     "homeassistant.local")
-MQTT_PORT     = int(os.getenv("MQTT_PORT", "1883"))
+MQTT_HOST = os.getenv("MQTT_HOST", "homeassistant.local")
+MQTT_PORT = int(os.getenv("MQTT_PORT", "1883"))
 MQTT_USERNAME = os.getenv("MQTT_USERNAME", "")
 MQTT_PASSWORD = os.getenv("MQTT_PASSWORD", "")
-DEVICE_NAME   = os.getenv("DEVICE_NAME",   "Smart Display")
-DEVICE_ID     = os.getenv("DEVICE_ID",
-                    os.uname().nodename.lower().replace("-", "_"))
+DEVICE_NAME = os.getenv("DEVICE_NAME", "Smart Display")
+DEVICE_ID = os.getenv("DEVICE_ID",
+                      os.uname().nodename.lower().replace("-", "_"))
+
+# Whether this device has a display attached. Headless voice-only satellites
+# set HAS_DISPLAY=false so brightness/dashboard entities are never registered
+# in HA at all, rather than being registered as permanent no-ops.
+HAS_DISPLAY = os.getenv("HAS_DISPLAY", "true").strip().lower() in ("1", "true", "yes")
 
 # Dashboard refresh: the kiosk Chromium is launched with --remote-debugging-port
 # so the bridge can reload it or navigate it to a new URL over CDP — e.g. to
 # recover the display after Home Assistant reboots, or to push a test dashboard.
-CDP_PORT      = int(os.getenv("CDP_PORT", "9222"))
+# Only relevant/used when HAS_DISPLAY is true.
+CDP_PORT = int(os.getenv("CDP_PORT", "9222"))
 DASHBOARD_URL = os.getenv("DASHBOARD_URL", "")  # the device's configured kiosk URL
 
 # ── State file paths ───────────────────────────────────────────────────────────
-HOME           = Path.home()
-TTS_VOL_FILE   = HOME / ".smart-display-tts-volume"
+HOME = Path.home()
+TTS_VOL_FILE = HOME / ".smart-display-tts-volume"
 MEDIA_VOL_FILE = HOME / ".smart-display-media-volume"
-MIC_GAIN_FILE  = HOME / ".smart-display-mic-gain"
-BACKLIGHT_DIR  = Path("/sys/class/backlight/10-0045")
+MIC_GAIN_FILE = HOME / ".smart-display-mic-gain"
+
+# Backlight sysfs node differs between Pi 4 (10-0045) and Pi 5 (11-0045) due to
+# RP1 I2C bus renumbering. Configurable rather than hardcoded so the same
+# bridge script works on either, matching configure.sh's hardware-variant split.
+BACKLIGHT_DIR = Path(f"/sys/class/backlight/{os.getenv('BACKLIGHT_NODE', '10-0045')}")
 
 # WM8960 Capture PGA gain range (numid=1): ALSA values 0–63.
-# 0 = minimum gain (~-17 dB),  63 = maximum gain (+30 dB),  40 = 0 dB default.
+# 0 = minimum gain (~-17 dB), 63 = maximum gain (+30 dB), 40 = 0 dB default.
 MIC_GAIN_ALSA_MAX = 63
 
 # ── MQTT topic helpers ─────────────────────────────────────────────────────────
 BASE = f"smart-display/{DEVICE_ID}"
 AVAIL_TOPIC = f"{BASE}/availability"
 
-def state_topic(entity:   str) -> str: return f"{BASE}/{entity}/state"
+def state_topic(entity: str) -> str: return f"{BASE}/{entity}/state"
 def command_topic(entity: str) -> str: return f"{BASE}/{entity}/set"
 def config_topic(component: str, entity: str) -> str:
     return f"homeassistant/{component}/{DEVICE_ID}/{entity}/config"
 
 # ── Shared device descriptor ───────────────────────────────────────────────────
 DEVICE = {
-    "identifiers":  [DEVICE_ID],
-    "name":         DEVICE_NAME,
-    "model":        "Smart Display",
+    "identifiers": [DEVICE_ID],
+    "name": DEVICE_NAME,
+    "model": "Smart Display" if HAS_DISPLAY else "Smart Speaker",
     "manufacturer": "DIY",
-    "sw_version":   "1.0",
+    "sw_version": "1.0",
 }
 
 # ── Discovery payload builders ─────────────────────────────────────────────────
@@ -106,7 +124,8 @@ def _number(entity_id: str, name: str, icon: str,
         "optimistic":            False,
     }
 
-# All discovery registrations: (config_topic, payload)
+# All discovery registrations: (config_topic, payload).
+# Entities common to every device (display or not):
 DISCOVERY = [
     (config_topic("number", "tts_volume"),
      _number("tts_volume",   "Voice Volume", "mdi:account-voice")),
@@ -114,17 +133,24 @@ DISCOVERY = [
     (config_topic("number", "media_volume"),
      _number("media_volume", "Media Volume", "mdi:music")),
 
-    (config_topic("number", "brightness"),
-     _number("brightness",   "Brightness",   "mdi:brightness-6", min_=0)),
-
     (config_topic("number", "mic_gain"),
      _number("mic_gain",     "Mic Sensitivity", "mdi:microphone-settings")),
+]
+
+# Display-only entities — only registered when HAS_DISPLAY is true, so a
+# headless voice satellite never gets brightness/dashboard controls that
+# would have nothing to act on.
+if HAS_DISPLAY:
+    DISCOVERY.append((
+        config_topic("number", "brightness"),
+        _number("brightness", "Brightness", "mdi:brightness-6", min_=0)
+    ))
 
     # Dashboard refresh — a button that reloads the kiosk page, and a text box
     # to navigate it to any URL. Both publish to the shared "dashboard" command
     # topic; the bridge drives Chromium over CDP. Handy after an HA reboot or to
     # push a test dashboard to the screen.
-    (config_topic("button", "dashboard_reload"), {
+    DISCOVERY.append((config_topic("button", "dashboard_reload"), {
         "name":                  "Reload Dashboard",
         "unique_id":             f"{DEVICE_ID}_dashboard_reload",
         "device":                DEVICE,
@@ -134,9 +160,9 @@ DISCOVERY = [
         "availability_topic":    AVAIL_TOPIC,
         "payload_available":     "online",
         "payload_not_available": "offline",
-    }),
+    }))
 
-    (config_topic("text", "dashboard_url"), {
+    DISCOVERY.append((config_topic("text", "dashboard_url"), {
         "name":                  "Dashboard URL",
         "unique_id":             f"{DEVICE_ID}_dashboard_url",
         "device":                DEVICE,
@@ -149,13 +175,13 @@ DISCOVERY = [
         "availability_topic":    AVAIL_TOPIC,
         "payload_available":     "online",
         "payload_not_available": "offline",
-    }),
+    }))
 
-]
-
+# Command topics to subscribe to — display-only ones only added when relevant.
 COMMAND_TOPICS = {command_topic(e) for e in
-                  ("tts_volume", "media_volume", "brightness", "mic_gain",
-                   "dashboard")}
+                  ("tts_volume", "media_volume", "mic_gain")}
+if HAS_DISPLAY:
+    COMMAND_TOPICS |= {command_topic("brightness"), command_topic("dashboard")}
 
 # ── Hardware helpers ───────────────────────────────────────────────────────────
 def _read_state(path: Path, default: int) -> int:
@@ -172,8 +198,8 @@ def _write_state(path: Path, value: int) -> None:
 
 def _read_brightness_pct() -> int:
     try:
-        max_b    = int((BACKLIGHT_DIR / "max_brightness").read_text().strip())
-        current  = int((BACKLIGHT_DIR / "brightness").read_text().strip())
+        max_b = int((BACKLIGHT_DIR / "max_brightness").read_text().strip())
+        current = int((BACKLIGHT_DIR / "brightness").read_text().strip())
         return max(0, min(100, round(current * 100 / max_b)))
     except OSError:
         return 100
@@ -226,7 +252,8 @@ def _set_brightness(level: int) -> None:
 # Chromium is launched in the kiosk with --remote-debugging-port=CDP_PORT, so we
 # can reload it or navigate it without touching the Wayland session. This is the
 # recovery path when HA reboots and the displays are left on a dead page.
-
+# Only ever called when HAS_DISPLAY is true (no dashboard command topic is
+# subscribed to otherwise, so on_message never routes here on a headless build).
 def _cdp_ws_url() -> str | None:
     """Return the WebSocket debugger URL for the active kiosk page, or None."""
     with urllib.request.urlopen(
@@ -263,10 +290,9 @@ def _cdp_send(method: str, params: dict | None = None) -> bool:
 
 def _handle_dashboard(client, payload: str) -> None:
     """Interpret a dashboard command payload and drive Chromium accordingly.
-
-      ''/'reload'/'refresh' → reload the current page (ignoring cache)
-      'home'                → navigate back to the configured kiosk URL
-      'http(s)://…'         → navigate to that URL (e.g. a test dashboard)
+       ''/'reload'/'refresh'   → reload the current page (ignoring cache)
+       'home'                  → navigate back to the configured kiosk URL
+       'http(s)://…'           → navigate to that URL (e.g. a test dashboard)
     """
     cmd = payload.strip()
     low = cmd.lower()
@@ -294,7 +320,6 @@ def on_connect(client, userdata, connect_flags, reason_code, properties):
     if reason_code.is_failure:
         print(f"[mqtt] Connection failed: {reason_code} — will retry.")
         return
-
     print(f"[mqtt] Connected to {MQTT_HOST}:{MQTT_PORT} as '{DEVICE_ID}'.")
 
     # Mark device online
@@ -305,11 +330,12 @@ def on_connect(client, userdata, connect_flags, reason_code, properties):
         client.publish(topic, json.dumps(payload), retain=True)
 
     # Publish current state so HA sliders reflect actual values immediately
-    client.publish(state_topic("tts_volume"),   str(_read_state(TTS_VOL_FILE,   90)), retain=True)
+    client.publish(state_topic("tts_volume"),   str(_read_state(TTS_VOL_FILE, 90)),   retain=True)
     client.publish(state_topic("media_volume"), str(_read_state(MEDIA_VOL_FILE, 75)), retain=True)
-    client.publish(state_topic("brightness"),   str(_read_brightness_pct()),           retain=True)
-    client.publish(state_topic("mic_gain"),     str(_read_mic_gain_pct()),             retain=True)
-    client.publish(state_topic("dashboard_url"), DASHBOARD_URL,                         retain=True)
+    client.publish(state_topic("mic_gain"),     str(_read_mic_gain_pct()),            retain=True)
+    if HAS_DISPLAY:
+        client.publish(state_topic("brightness"),    str(_read_brightness_pct()), retain=True)
+        client.publish(state_topic("dashboard_url"), DASHBOARD_URL,               retain=True)
 
     # Subscribe to all command topics
     for topic in COMMAND_TOPICS:
@@ -342,7 +368,7 @@ def on_message(client, userdata, msg):
         client.publish(state_topic("media_volume"), str(level), retain=True)
         print(f"[media-volume] → {level}%")
 
-    elif topic == command_topic("brightness"):
+    elif HAS_DISPLAY and topic == command_topic("brightness"):
         try:
             level = max(0, min(100, int(float(payload))))
         except ValueError:
@@ -361,7 +387,7 @@ def on_message(client, userdata, msg):
         client.publish(state_topic("mic_gain"), str(level), retain=True)
         print(f"[mic-gain] → {level}% (ALSA {round(level * MIC_GAIN_ALSA_MAX / 100)})")
 
-    elif topic == command_topic("dashboard"):
+    elif HAS_DISPLAY and topic == command_topic("dashboard"):
         _handle_dashboard(client, payload)
 
 def on_disconnect(client, userdata, disconnect_flags, reason_code, properties):
@@ -377,14 +403,14 @@ def _shutdown(sig, frame):
     sys.exit(0)
 
 signal.signal(signal.SIGTERM, _shutdown)
-signal.signal(signal.SIGINT,  _shutdown)
+signal.signal(signal.SIGINT, _shutdown)
 
 client = mqtt.Client(
     callback_api_version=mqtt.CallbackAPIVersion.VERSION2,
     client_id=f"smart-display-{DEVICE_ID}",
 )
-client.on_connect    = on_connect
-client.on_message    = on_message
+client.on_connect = on_connect
+client.on_message = on_message
 client.on_disconnect = on_disconnect
 
 # LWT: if the Pi disconnects ungracefully, HA marks the device unavailable
@@ -399,6 +425,7 @@ if MQTT_USERNAME:
 print(f"[ready] Smart Display MQTT bridge starting.")
 print(f"        Broker  : {MQTT_HOST}:{MQTT_PORT}")
 print(f"        Device  : {DEVICE_NAME} ({DEVICE_ID})")
+print(f"        Display : {'yes' if HAS_DISPLAY else 'no (headless)'}")
 
 client.connect_async(MQTT_HOST, MQTT_PORT, keepalive=60)
 client.loop_forever()
