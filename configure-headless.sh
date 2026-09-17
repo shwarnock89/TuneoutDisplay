@@ -977,16 +977,19 @@ if [ "$MUSIC_PLAYER" = "music-assistant" ] || [ "$MUSIC_PLAYER" = "both" ]; then
     sudo "$PY312" -m venv /opt/sendspin
     sudo /opt/sendspin/bin/pip install --upgrade sendspin -q
 
-    # sendspin's own dependency pin on aiosendspin can lag behind what the
-    # Music Assistant server's protocol actually sends -- this showed up as
-    # repeated "mashumaro.exceptions.InvalidFieldValue" errors parsing
-    # server/state messages (e.g. new command names like 'unshuffle',
-    # 'repeat_off' the older aiosendspin didn't know about), which in turn
-    # meant volume/state changes from the MA UI never reached the client.
-    # Force aiosendspin to its own latest explicitly, on top of whatever
-    # sendspin's install pulled in.
-    info "Ensuring aiosendspin is current (protocol compatibility with MA server)..."
-    sudo /opt/sendspin/bin/pip install --upgrade aiosendspin -q
+    # NOTE: we used to force aiosendspin to its own absolute latest here,
+    # separately from whatever sendspin's own install pulled in. That was a
+    # real mistake -- found the hard way when it caused a hard crash-loop
+    # (ImportError, then ModuleNotFoundError, across two different forced
+    # "latest" versions) because sendspin itself declares a specific
+    # compatible aiosendspin range (currently ~=6.0.1) and this ecosystem is
+    # under very active, breaking development. Forcing aiosendspin past what
+    # sendspin actually asks for breaks it outright rather than fixing
+    # anything. Letting pip's normal dependency resolution pick the version
+    # sendspin itself wants is the correct, stable behaviour -- don't
+    # "helpfully" override it again without confirming sendspin's own pinned
+    # range has actually moved forward to match.
+    info "aiosendspin version left to sendspin's own dependency resolution (not force-upgraded)."
 
     info "Creating sendspin.service..."
     sudo tee /etc/systemd/system/sendspin.service > /dev/null << EOF
@@ -1307,6 +1310,14 @@ automation:
 The device registers itself in Music Assistant 2.7+ as **"__DEVICENAME__"** automatically.
 No additional configuration needed — it appears as a player in MA the moment sendspin connects.
 (Only applies if you chose `music-assistant` or `both` as the music player.)
+
+> **Check the player's volume in MA after first setup.** Music Assistant
+> pushes its own stored volume level to the player on connect — for a
+> freshly-added player this has been observed defaulting to a fairly quiet
+> level (~25%), independent of anything on the device side. This isn't
+> something `configure.sh` can set (it's Music Assistant's own per-player
+> state, not a device setting) — just raise it once in MA's own player
+> volume slider/UI and it'll persist from then on.
 
 If you chose `caldera` or `both`, finish the one-time Plex login on the Pi:
 
