@@ -99,7 +99,7 @@ fi
 # Check that the companion Python scripts are present alongside configure.sh.
 # SCRIPT_DIR is resolved at the top of the script before any cd commands.
 _MISSING_FILES=()
-for _f in mqtt-bridge.py touch-scroll.py; do
+for _f in mqtt-bridge.py; do
     if [ ! -f "$SCRIPT_DIR/$_f" ]; then
         _MISSING_FILES+=("$_f")
     fi
@@ -205,16 +205,8 @@ _def="${WAKE_WORD:-hey_jarvis}"
 read -rp "  Wake word model          [${_def}]: " _in
 WAKE_WORD="${_in:-${_def}}"
 
-_def="${KIOSK_URL:-}"
-read -rp "  Lovelace kiosk URL       [${_def:-none}]: " _in
-# Accept an explicit blank entry ("") to clear a previously saved kiosk URL.
-# Pressing ENTER keeps the saved value; typing a space then ENTER also clears.
-if [ -z "$_in" ]; then
-    KIOSK_URL="${_def}"
-else
-    KIOSK_URL="${_in}"
-    [ "$KIOSK_URL" = "none" ] && KIOSK_URL=""
-fi
+# (No kiosk URL prompt -- headless build, no display attached.)
+KIOSK_URL=""
 
 echo ""
 echo "  ── Music player ──"
@@ -289,7 +281,6 @@ printf  "  │  Hardware     : %-38s│\n" "$HARDWARE_VARIANT"
 printf  "  │  HA server    : %-38s│\n" "$HA_SERVER"
 printf  "  │  Wake word    : %-38s│\n" "$WAKE_WORD"
 printf  "  │  Music player : %-38s│\n" "$MUSIC_PLAYER"
-printf  "  │  Kiosk URL    : %-38s│\n" "$([ -n "$KIOSK_URL" ] && echo "${KIOSK_URL:0:38}" || echo "skipped")"
 printf  "  │  MQTT broker  : %-38s│\n" "${MQTT_HOST}:${MQTT_PORT}"
 printf  "  │  MQTT auth    : %-38s│\n" "$([ -n "$MQTT_USERNAME" ] && echo "yes (${MQTT_USERNAME})" || echo "none")"
 echo "  └────────────────────────────────────────────────────────┘"
@@ -363,12 +354,15 @@ section "Installing Dependencies"
 
 info "Installing dependencies..."
 sudo apt install -y \
-    git sox alsa-utils unclutter-xfixes python3-paho-mqtt python3-evdev \
+    git sox alsa-utils python3-paho-mqtt \
     python3-websocket \
     avahi-daemon avahi-utils \
     pipewire pipewire-bin pipewire-pulse wireplumber \
     libmpv-dev mpv libasound2-plugins pulseaudio-utils \
     python3-venv python3-dev build-essential jq
+# Note: unclutter-xfixes (cursor-hiding) and python3-evdev (touchscreen input,
+# used by touch-scroll.py) are intentionally omitted -- both are display/kiosk
+# specific and not needed for a headless voice satellite.
 # Note: pipewire-audio (meta-package) and pipewire-alsa are intentionally
 # omitted. pipewire-audio pulls in pipewire-alsa which intercepts all ALSA
 # calls at the library level, preventing dmix from opening the hardware
@@ -944,28 +938,7 @@ sudo systemctl enable smart-display-audio-init
 sudo systemctl restart smart-display-audio-init
 success "Audio init service enabled — volume and ALC will be restored on every boot."
 
-# ── Backlight Permissions ─────────────────────────────────────────────────────
-section "Backlight Permissions"
-
-# The DSI display backlight is owned by root. Grant the video group write access
-# so the MQTT bridge can adjust brightness without sudo.
-# The kernel name is the I2C address of the display controller, and it DIFFERS
-# between Pi 4 and Pi 5 -- Pi 5's RP1 southbridge renumbers I2C buses vs Pi 4.
-# Confirmed earlier in this project via: ls /sys/class/backlight/  (check this
-# matches your actual system if backlight control doesn't work -- it's this
-# exact node name that matters, not the hardware variant assumption below).
-if [ "$HARDWARE_VARIANT" = "pi4-v1" ]; then
-    _BACKLIGHT_NODE="10-0045"
-else
-    _BACKLIGHT_NODE="11-0045"
-fi
-info "Setting up backlight udev rule for display ($_BACKLIGHT_NODE)..."
-sudo tee /etc/udev/rules.d/99-backlight.rules > /dev/null << EOF
-SUBSYSTEM=="backlight", KERNEL=="$_BACKLIGHT_NODE", GROUP="video", MODE="0664"
-EOF
-sudo usermod -a -G video "$CURRENT_USER"
-sudo udevadm control --reload-rules && sudo udevadm trigger
-success "Backlight permissions configured. (Takes effect on next login/reboot.)"
+# (No backlight section -- headless build, no display attached.)
 
 # ── sendspin (Music Assistant native player) ──────────────────────────────────
 # Installed only when the chosen music player is "music-assistant" or "both".
@@ -1180,8 +1153,7 @@ DEVICE_NAME=$DEVICE_NAME
 DEVICE_ID=$(echo "$DEVICE_NAME" | tr '[:upper:]' '[:lower:]' | tr ' ' '_' | tr -cd 'a-z0-9_')
 DASHBOARD_URL=$KIOSK_URL
 CDP_PORT=9222
-HAS_DISPLAY=true
-BACKLIGHT_NODE=$_BACKLIGHT_NODE
+HAS_DISPLAY=false
 ENVEOF
     sudo chmod 600 "$MQTT_ENV_FILE"
 
@@ -1213,138 +1185,7 @@ EOF
     info "Ensure MQTT discovery is enabled in HA's MQTT integration settings."
 fi
 
-# ── Touch Scroll Daemon ───────────────────────────────────────────────────────
-section "Touch Scroll Daemon"
-
-# labwc (wlroots) emulates the FT5x06 touchscreen as a pointer device, so
-# tapping and dragging work but scroll gestures are never generated.  This
-# lightweight daemon monitors the raw touch input node and injects REL_WHEEL
-# events via uinput whenever a vertical swipe is detected.  libinput picks up
-# the virtual device and labwc forwards the scroll events to Wayland clients.
-
-TOUCH_SCROLL_SCRIPT="$CURRENT_HOME/touch-scroll.py"
-info "Installing touch-scroll.py..."
-_src=""
-for _loc in "$SCRIPT_DIR/touch-scroll.py" "$(pwd)/touch-scroll.py"; do
-    [ -f "$_loc" ] && _src="$_loc" && break
-done
-if [ -n "$_src" ]; then
-    cp "$_src" "$TOUCH_SCROLL_SCRIPT"
-else
-    warn "Could not find touch-scroll.py — skipping. Copy it manually to $TOUCH_SCROLL_SCRIPT"
-fi
-
-if [ -f "$TOUCH_SCROLL_SCRIPT" ]; then
-    chmod +x "$TOUCH_SCROLL_SCRIPT"
-
-    info "Creating smart-display-touch-scroll.service..."
-    sudo tee /etc/systemd/system/smart-display-touch-scroll.service > /dev/null << 'TSEOF'
-[Unit]
-Description=Smart Display Touch-to-Scroll Daemon
-After=systemd-udev-settle.service
-Wants=systemd-udev-settle.service
-
-[Service]
-Type=simple
-ExecStart=/usr/local/bin/touch-scroll.py
-Restart=on-failure
-RestartSec=3
-StandardOutput=journal
-StandardError=journal
-
-[Install]
-WantedBy=multi-user.target
-TSEOF
-
-    sudo cp "$TOUCH_SCROLL_SCRIPT" /usr/local/bin/touch-scroll.py
-    sudo chmod +x /usr/local/bin/touch-scroll.py
-    sudo systemctl daemon-reload
-    sudo systemctl enable smart-display-touch-scroll
-    sudo systemctl restart smart-display-touch-scroll
-    success "Touch scroll daemon enabled and started."
-fi
-
-# ── Kiosk Mode (optional) ─────────────────────────────────────────────────────
-if [ -n "$KIOSK_URL" ]; then
-    section "Kiosk Mode"
-
-    info "Enabling desktop autologin..."
-    sudo raspi-config nonint do_boot_behaviour B4
-
-    info "Disabling console blanking..."
-    if ! grep -q "consoleblank=0" /boot/firmware/cmdline.txt; then
-        sudo sed -i 's/$/ consoleblank=0/' /boot/firmware/cmdline.txt
-        success "consoleblank=0 added to cmdline.txt"
-    else
-        info "consoleblank=0 already present."
-    fi
-
-    # Use labwc's native autostart (shell script) rather than XDG .desktop files.
-    # labwc on Raspberry Pi OS Trixie does not reliably process ~/.config/autostart/
-    # but always executes ~/.config/labwc/autostart if it is marked executable.
-    #
-    # --ozone-platform=wayland   → native Wayland rendering (fixes touch/gesture support)
-    # --touch-events=enabled     → explicitly enable touch input
-    # --disable-pinch            → prevent accidental pinch-zoom on kiosk
-    # The curl retry loop waits for HA to be reachable before launching Chromium,
-    # preventing a permanent error page if the network is slow to come up.
-    info "Creating labwc kiosk autostart..."
-    mkdir -p "$CURRENT_HOME/.config/labwc"
-    cat > "$CURRENT_HOME/.config/labwc/autostart" << EOF
-# Hide the taskbar panel
-pkill lxpanel || true
-pkill wfbar || true
-
-# Re-apply WM8960 hardware speaker level (true max = numid=13 value 127).
-# This runs here in addition to smart-display-audio-init.service because the
-# audio-init service fires early in boot before the codec registers have fully
-# settled; by the time the desktop session starts the driver is stable.
-amixer -c seeed2micvoicec cset numid=13 127,127 -q 2>/dev/null || true
-
-# Hide the mouse cursor
-unclutter --timeout 1 &
-
-# Launch Chromium in kiosk mode.
-# Explicitly export Wayland session variables — the subshell used for the
-# curl retry loop doesn't always inherit them from the labwc session.
-# Waits for Home Assistant to be reachable before opening the browser
-# so the display never gets stuck on an error page at boot.
-(
-  export WAYLAND_DISPLAY="\${WAYLAND_DISPLAY:-wayland-0}"
-  export XDG_RUNTIME_DIR="\${XDG_RUNTIME_DIR:-/run/user/\$(id -u)}"
-  export XDG_SESSION_TYPE=wayland
-
-  until curl -s --head "$HA_SERVER" > /dev/null 2>&1; do
-    sleep 3
-  done
-  chromium \
-    --kiosk \
-    --ozone-platform=wayland \
-    --touch-events=enabled \
-    --remote-debugging-port=9222 \
-    --remote-allow-origins=* \
-    --noerrdialogs \
-    --disable-infobars \
-    --no-first-run \
-    --disable-session-crashed-bubble \
-    --hide-scrollbars \
-    --password-store=basic \
-    --check-for-update-interval=31536000 \
-    --disable-dev-shm-usage \
-    --renderer-process-limit=1 \
-    --disable-extensions \
-    --disable-sync \
-    --disable-background-networking \
-    --disable-features=TranslateUI \
-    --js-flags="--max-old-space-size=192" \
-    "$KIOSK_URL"
-) &
-EOF
-    chmod +x "$CURRENT_HOME/.config/labwc/autostart"
-    success "labwc kiosk autostart created and marked executable."
-else
-    info "No kiosk URL provided — skipping kiosk mode setup."
-fi
+# (No touch-scroll daemon or kiosk mode -- headless build, no display/touchscreen attached.)
 
 # ── Home Assistant Setup README ───────────────────────────────────────────────
 section "Generating Home Assistant Setup README"
@@ -1377,12 +1218,15 @@ Verify under **Settings → Devices & Services → MQTT → __DEVICENAME__**:
 |-----------|---------|
 | `number.__DEVICEID___tts_volume` | Voice / TTS volume (0–100) |
 | `number.__DEVICEID___media_volume` | Music Assistant volume (0–100) |
-| `number.__DEVICEID___brightness` | Display brightness (0–100) |
+| `number.__DEVICEID___brightness` | (No display on this device -- harmless no-op) |
 | `number.__DEVICEID___mic_gain` | Mic sensitivity (0–100) |
-| `button.__DEVICEID___dashboard_reload` | Reload the kiosk dashboard |
-| `text.__DEVICEID___dashboard_url` | Navigate the kiosk to a URL |
+| `button.__DEVICEID___dashboard_reload` | (No display/browser on this device -- harmless no-op) |
+| `text.__DEVICEID___dashboard_url` | (No display/browser on this device -- harmless no-op) |
 
-> **Note:** If entity IDs differ, check the actual names in HA under the device page.
+> **Note:** This is a headless (no display) build. The bridge script still
+> registers brightness/dashboard entities since it's shared with the display
+> variant, but they have nothing to act on here -- safe to ignore.
+> If entity IDs differ, check the actual names in HA under the device page.
 > HA may append `_2`, `_3` etc. on re-registrations.
 
 ---
@@ -1476,31 +1320,6 @@ while Caldera is playing — if not, point Caldera's output at `seeed_media`.
 
 ---
 
-## 7. Dashboard Refresh
-
-Reload the kiosk page (e.g. after an HA reboot) or push a new dashboard URL:
-
-- **Reload Dashboard** button and **Dashboard URL** text box appear on the device in HA.
-- Or publish to `smart-display/__DEVICEID__/dashboard/set`:
-  `reload` (reload), `home` (back to the kiosk URL), or any `http(s)://…` URL.
-
-To auto-reload all displays after HA restarts:
-
-```yaml
-automation:
-  - alias: "Reload smart displays after HA restart"
-    trigger:
-      - platform: homeassistant
-        event: start
-    action:
-      - delay: "00:00:30"
-      - action: button.press
-        target:
-          entity_id: button.__DEVICEID___dashboard_reload
-```
-
----
-
 ## Diagnostic Commands
 
 ```bash
@@ -1567,7 +1386,7 @@ echo "  │  5. Say your wake word and test the voice pipeline!          │"
 echo "  └─────────────────────────────────────────────────────────────┘"
 echo ""
 echo "  To check all service status after reboot:"
-echo "    sudo systemctl status linux-voice-assistant sendspin smart-display-touch-scroll"
+echo "    sudo systemctl status linux-voice-assistant sendspin smart-display-mqtt"
 echo ""
 echo "  To follow live logs:"
 echo "    sudo journalctl -u linux-voice-assistant -f"
